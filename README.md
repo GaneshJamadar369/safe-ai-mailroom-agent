@@ -1,0 +1,26 @@
+# Safe AI Mailroom
+
+FastAPI service for the GA5 `ga5-mailroom-action-gate/v2` propose/commit contract.
+
+## Local run
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+$env:GROQ_API_KEY = "your-new-key"
+$env:DATABASE_PATH = ".\data\mailroom.sqlite3"
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+`.env.example` is documentation only; FastAPI does not load it automatically. Set `GROQ_API_KEY` in the process environment or your hosting provider's secret manager, and never commit a real key.
+
+The single public POST endpoint is `/`. Send `Content-Type: application/json` and the JSON envelopes from the assignment. The service uses AI only for semantic decisions; schema checks, canonical hashing, persistence, replay/conflict handling, and Ed25519 receipt validation use deterministic code.
+
+## Deployment
+
+Use Render or another persistent-disk host. The SQLite file must live on persistent storage. On Render, attach a persistent disk mounted at `/var/data` and set `DATABASE_PATH=/var/data/safe-ai-mailroom.sqlite3`. Add `GROQ_API_KEY` through the dashboard; never commit credentials. Submit the HTTPS service root URL, with no query string or fragment.
+
+## Important limits
+
+This is a starting implementation, not a guarantee of passing hidden evaluations. Test against the real endpoint locally with synthetic dossiers and generated Ed25519 keys before using any grader Check. LLM decision quality and latency on the full batch remain uncertain and should be measured. No outbound email is sent by this service; outcomes record accepted/rejected proposals only, as the grader contract describes.
