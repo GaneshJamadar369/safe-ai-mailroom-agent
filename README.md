@@ -19,7 +19,7 @@ For local development, `groqapikeys.txt` may contain one key per line and is ign
 
 Render logs are JSON lines. Search by `request_id` or `evaluation_id`; set `LOG_LEVEL=DEBUG` temporarily for framework-level diagnostics. Logs intentionally exclude raw dossier text, model prompts, API keys, receipt signatures, and other secret material.
 
-Model requests are automatically split into bounded concurrent batches (`GROQ_BATCH_BYTES`, default `18000`) so a full grader Check does not exceed the provider request limit. If Groq still returns 413, the affected batch is split again automatically. `GROQ_MAX_TOKENS` defaults to `4000` so input plus completion stays within provider context limits.
+Model requests are automatically split into bounded batches (`GROQ_BATCH_BYTES`, default `8500`) and limited to two concurrent provider calls (`GROQ_MODEL_CONCURRENCY=2`). This avoids both Groq 413 payload errors and 429 rate-limit storms on a full grader Check. If Groq still returns 413, the affected batch is split again automatically. `GROQ_MAX_TOKENS` defaults to `2000`, enough for the compact proposal schema while leaving context headroom.
 
 The single public POST endpoint is `/`. Send `Content-Type: application/json` and the JSON envelopes from the assignment. The service uses AI only for semantic decisions; schema checks, canonical hashing, persistence, replay/conflict handling, and Ed25519 receipt validation use deterministic code.
 

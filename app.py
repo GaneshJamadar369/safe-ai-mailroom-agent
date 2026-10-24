@@ -47,7 +47,8 @@ MAX_RESPONSE_BYTES = 512 * 1024
 DB_PATH = os.getenv("DATABASE_PATH", "./data/safe-ai-mailroom.sqlite3")
 GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_BATCH_BYTES = int_env("GROQ_BATCH_BYTES", 18000)
+GROQ_BATCH_BYTES = int_env("GROQ_BATCH_BYTES", 8500)
+GROQ_MODEL_CONCURRENCY = int_env("GROQ_MODEL_CONCURRENCY", 2)
 GROQ_KEYS_FILE = os.getenv("GROQ_KEYS_FILE", "groqapikeys.txt")
 _groq_key_cursor = 0
 _groq_key_lock = threading.Lock()
@@ -391,7 +392,7 @@ async def _ai_decisions_batch(dossiers: list[dict[str, Any]]) -> dict[str, dict[
     body = {
         "model": os.getenv("GROQ_MODEL", GROQ_MODEL),
         "temperature": 0,
-        "max_completion_tokens": int_env("GROQ_MAX_TOKENS", 4000),
+        "max_completion_tokens": int_env("GROQ_MAX_TOKENS", 2000),
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt()},
@@ -451,9 +452,13 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
     batches: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_bytes = 0
+    # Groq's effective request limit includes system prompt and completion
+    # allowance. Cap user configuration at a conservative payload size; the
+    # recursive splitter remains available for unusually large dossiers.
+    batch_limit = min(GROQ_BATCH_BYTES, 8500)
     for dossier in dossiers:
         size = len(canon(dossier).encode("utf-8"))
-        if current and current_bytes + size > GROQ_BATCH_BYTES:
+        if current and current_bytes + size > batch_limit:
             batches.append(current)
             current = []
             current_bytes = 0
@@ -462,7 +467,7 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
     if current:
         batches.append(current)
     log_event("model_batches_planned", dossier_count=len(dossiers), batch_count=len(batches),
-              batch_bytes_limit=GROQ_BATCH_BYTES)
+              batch_bytes_limit=batch_limit, concurrency=GROQ_MODEL_CONCURRENCY)
     async def resilient_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         try:
             return await _ai_decisions_batch(batch)
@@ -484,7 +489,15 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
             left.update(right)
             return left
 
-    results = await asyncio.gather(*(resilient_batch(batch) for batch in batches))
+    semaphore = asyncio.Semaphore(GROQ_MODEL_CONCURRENCY)
+
+    async def guarded_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        async with semaphore:
+            return await resilient_batch(batch)
+
+    # Keep only a small number of provider calls in flight. This avoids a
+    # cascade of 429s when a full 64-dossier check arrives at once.
+    results = await asyncio.gather(*(guarded_batch(batch) for batch in batches))
     merged: dict[str, dict[str, Any]] = {}
     for result in results:
         overlap = set(merged).intersection(result)
