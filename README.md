@@ -15,7 +15,11 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 `.env.example` is documentation only; FastAPI does not load it automatically. Set `GROQ_API_KEY` in the process environment or your hosting provider's secret manager, and never commit a real key.
 
+For local development, `groqapikeys.txt` may contain one key per line and is ignored by git. In Render, configure `GROQ_API_KEYS` as a comma/newline-separated secret instead. On HTTP 401, 403, or 429, the service rotates to the next configured key; it does not retry payload-size failures.
+
 Render logs are JSON lines. Search by `request_id` or `evaluation_id`; set `LOG_LEVEL=DEBUG` temporarily for framework-level diagnostics. Logs intentionally exclude raw dossier text, model prompts, API keys, receipt signatures, and other secret material.
+
+Model requests are automatically split into bounded concurrent batches (`GROQ_BATCH_BYTES`, default `60000`) so a full grader Check does not exceed the provider request limit.
 
 The single public POST endpoint is `/`. Send `Content-Type: application/json` and the JSON envelopes from the assignment. The service uses AI only for semantic decisions; schema checks, canonical hashing, persistence, replay/conflict handling, and Ed25519 receipt validation use deterministic code.
 

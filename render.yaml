@@ -9,8 +9,12 @@ services:
     envVars:
       - key: GROQ_API_KEY
         sync: false
+      - key: GROQ_API_KEYS
+        sync: false
       - key: GROQ_MODEL
         value: openai/gpt-oss-120b
+      - key: GROQ_BATCH_BYTES
+        value: "60000"
       - key: DATABASE_PATH
         # Free Render services do not provide /var/data unless a paid
         # persistent disk is attached. /tmp is writable at runtime; keep one

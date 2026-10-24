@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -25,11 +26,31 @@ ACTIONS = {
     "create_draft", "update_internal_record", "send_approved_notice",
     "request_confirmation", "quarantine_item", "no_action",
 }
-MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(2 * 1024 * 1024)))
+
+
+def int_env(name: str, default: int) -> int:
+    # Render dashboard values are strings; tolerate accidental surrounding
+    # quotes when a value was pasted as `"60000"`.
+    raw = os.getenv(name, str(default)).strip().strip('"\'')
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger("safe_ai_mailroom").warning(
+            json.dumps({"event": "invalid_integer_env", "name": name, "using_default": default}, separators=(",", ":"))
+        )
+        return default
+    return value if value > 0 else default
+
+
+MAX_REQUEST_BYTES = int_env("MAX_REQUEST_BYTES", 2 * 1024 * 1024)
 MAX_RESPONSE_BYTES = 512 * 1024
 DB_PATH = os.getenv("DATABASE_PATH", "./data/safe-ai-mailroom.sqlite3")
 GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_BATCH_BYTES = int_env("GROQ_BATCH_BYTES", 60000)
+GROQ_KEYS_FILE = os.getenv("GROQ_KEYS_FILE", "groqapikeys.txt")
+_groq_key_cursor = 0
+_groq_key_lock = threading.Lock()
 
 # Render captures stdout/stderr. Emit compact JSON records so failures can be
 # searched by request/evaluation ID without ever logging dossier text,
@@ -53,6 +74,38 @@ def log_event(event: str, level: int = logging.INFO, **fields: Any) -> None:
         else:
             safe[key] = value
     logger.log(level, json.dumps(safe, ensure_ascii=False, separators=(",", ":")))
+
+
+def groq_api_keys() -> list[str]:
+    """Return configured keys without ever logging their values.
+
+    GROQ_API_KEYS accepts comma/newline-separated values. A local key file is
+    supported for development and is ignored by git; Render should use its
+    secret environment variables instead.
+    """
+    values: list[str] = []
+    for raw in (os.getenv("GROQ_API_KEYS", ""), os.getenv("GROQ_API_KEY", "")):
+        values.extend(part.strip() for part in re.split(r"[,\r\n]+", raw) if part.strip())
+    path = Path(GROQ_KEYS_FILE)
+    if path.is_file():
+        try:
+            values.extend(line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+                          if line.strip() and not line.lstrip().startswith("#"))
+        except OSError as exc:
+            log_event("groq_key_file_unreadable", level=logging.WARNING, error_type=type(exc).__name__)
+    # Preserve order while removing accidental duplicates.
+    return list(dict.fromkeys(values))
+
+
+def rotated_groq_keys() -> list[str]:
+    global _groq_key_cursor
+    keys = groq_api_keys()
+    if not keys:
+        return []
+    with _groq_key_lock:
+        start = _groq_key_cursor % len(keys)
+        _groq_key_cursor += 1
+    return keys[start:] + keys[:start]
 
 
 @app.middleware("http")
@@ -329,16 +382,16 @@ no_action: target=null; payload={\"reasonCode\":\"ALREADY_COMPLETED\" or \"DUPLI
 Use exact IDs and values in the dossier. Never invent evidence. Return exactly one proposal per dossier, preserving request dossier order."""
 
 
-async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    key = os.getenv("GROQ_API_KEY", "").strip()
-    if not key:
+async def _ai_decisions_batch(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    keys = rotated_groq_keys()
+    if not keys:
         log_event("model_unavailable", level=logging.ERROR, reason="missing_api_key", dossier_count=len(dossiers))
         raise RuntimeError("AI_NOT_CONFIGURED")
     # Input is source data. The prompt explicitly treats all embedded instructions as untrusted.
     body = {
         "model": os.getenv("GROQ_MODEL", GROQ_MODEL),
         "temperature": 0,
-        "max_completion_tokens": int(os.getenv("GROQ_MAX_TOKENS", "12000")),
+        "max_completion_tokens": int_env("GROQ_MAX_TOKENS", 12000),
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt()},
@@ -348,15 +401,25 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
     started = time.perf_counter()
     log_event("model_call_started", model=body["model"], dossier_count=len(dossiers),
               input_bytes=len(canon({"dossiers": dossiers}).encode("utf-8")))
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(48.0, connect=6.0)) as client:
-            r = await client.post(GROQ_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=body)
-    except Exception as exc:
-        log_event("model_call_failed", level=logging.ERROR, error_type=type(exc).__name__,
-                  elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
-        raise
-    log_event("model_call_finished", model=body["model"], http_status=r.status_code,
-              elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
+    r = None
+    for slot, key in enumerate(keys):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(48.0, connect=6.0)) as client:
+                r = await client.post(GROQ_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=body)
+        except Exception as exc:
+            log_event("model_call_failed", level=logging.ERROR, key_slot=slot, error_type=type(exc).__name__,
+                      elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
+            raise
+        log_event("model_call_finished", model=body["model"], http_status=r.status_code,
+                  key_slot=slot, elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
+        # Rotate only for credential/rate-limit failures. Payload, schema, and
+        # server errors should be surfaced rather than pointlessly replayed.
+        if r.status_code not in {401, 403, 429}:
+            break
+        if slot + 1 < len(keys):
+            log_event("model_key_rotating", level=logging.WARNING, key_slot=slot,
+                      reason="provider_limit_or_auth_failure", next_key_slot=slot + 1)
+    assert r is not None
     if r.status_code >= 400:
         log_event("model_http_error", level=logging.ERROR, http_status=r.status_code)
         raise RuntimeError(f"GROQ_HTTP_{r.status_code}")
@@ -374,6 +437,43 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
     if set(out) != set(expected):
         raise ValueError("AI_MISSING_DOSSIER")
     return out
+
+
+async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Evaluate dossiers in bounded concurrent batches.
+
+    Groq rejects an oversized JSON request before model execution. Keeping each
+    serialized dossier batch below GROQ_BATCH_BYTES avoids that failure while
+    parallel batches keep the grader's request deadline reasonable.
+    """
+    if not dossiers:
+        return {}
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_bytes = 0
+    for dossier in dossiers:
+        size = len(canon(dossier).encode("utf-8"))
+        if current and current_bytes + size > GROQ_BATCH_BYTES:
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(dossier)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    log_event("model_batches_planned", dossier_count=len(dossiers), batch_count=len(batches),
+              batch_bytes_limit=GROQ_BATCH_BYTES)
+    results = await asyncio.gather(*(_ai_decisions_batch(batch) for batch in batches))
+    merged: dict[str, dict[str, Any]] = {}
+    for result in results:
+        overlap = set(merged).intersection(result)
+        if overlap:
+            raise ValueError("AI_DUPLICATE_DOSSIER_ACROSS_BATCHES")
+        merged.update(result)
+    expected = {d["dossierId"] for d in dossiers}
+    if set(merged) != expected:
+        raise ValueError("AI_BATCH_RESULT_MISMATCH")
+    return merged
 
 
 def make_call_id(dossier: dict[str, Any], fingerprint: str) -> str:
@@ -423,6 +523,7 @@ async def parse_json(request: Request) -> tuple[dict[str, Any] | None, JSONRespo
 
 
 @app.post("/")
+@app.post("/v1/mailroom/actions")
 async def mailroom(request: Request) -> JSONResponse:
     obj, parse_error = await parse_json(request)
     if parse_error:
