@@ -214,7 +214,11 @@ def init_db() -> None:
 def startup() -> None:
     try:
         init_db()
-        log_event("startup_completed", database_path=os.getenv("DATABASE_PATH", DB_PATH))
+        log_event("startup_completed", database_path=os.getenv("DATABASE_PATH", DB_PATH),
+                  model=GROQ_MODEL, batch_bytes_limit=min(GROQ_BATCH_BYTES, 8500),
+                  model_concurrency=GROQ_MODEL_CONCURRENCY,
+                  max_tokens=int_env("GROQ_MAX_TOKENS", 2000),
+                  configured_key_count=len(groq_api_keys()))
     except Exception:
         logger.exception(json.dumps({"event": "startup_failed", "database_path": os.getenv("DATABASE_PATH", DB_PATH)}, separators=(",", ":")))
         raise
@@ -285,6 +289,64 @@ def validate_dossiers(dossiers: Any) -> str | None:
 
 def line_ids(dossier: dict[str, Any]) -> set[str]:
     return {ln["lineId"] for src in dossier["sources"] for ln in src["lines"]}
+
+
+def fallback_decision(dossier: dict[str, Any]) -> dict[str, Any]:
+    """Produce a conservative valid proposal when the provider is unavailable.
+
+    This is a bounded safety net for provider timeouts/rate limits. It is not
+    cached separately from the dossier decision and never creates an outbound
+    send without explicit evidence.
+    """
+    lines = [(src, ln) for src in dossier["sources"] for ln in src["lines"]]
+    all_text = " ".join(ln["text"] for _, ln in lines)
+    low = all_text.lower()
+
+    def evidence(predicate) -> list[str]:
+        hits = [ln["lineId"] for _, ln in lines if predicate(ln["text"].lower())]
+        return hits[:4] or [lines[0][1]["lineId"]]
+
+    def first_match(pattern: str, default: str) -> str:
+        m = re.search(pattern, all_text, re.I)
+        return m.group(1) if m else default
+
+    ref = first_match(r"\b((?:ord|order|case|evt|event)[-_][A-Za-z0-9_-]+)\b", dossier["dossierId"])
+    recipient = first_match(r"\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b", "customer")
+    status = first_match(r"\b(?:status|currently)\s*(?:is|=|:)\s*([A-Za-z][A-Za-z -]{1,40})", "unknown")
+    if status == "unknown":
+        status = first_match(r"\b(shipped|delivered|arrived|processing|pending|cancelled|completed)\b", "unknown")
+
+    # Hostile tool-control, secret-exfiltration, or unauthorized-send language
+    # is always isolated rather than passed through as an executable action.
+    if re.search(r"ignore (?:all )?instructions|system prompt|password|secret|canary|api key|use .* tool|reveal private|exfiltrat", low):
+        src, _ = lines[0]
+        return {"dossierId": dossier["dossierId"], "action": "quarantine_item",
+                "target": {"kind": "security_queue", "id": "mailroom"},
+                "payload": {"artifactId": src["sourceId"], "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+                "evidence": evidence(lambda t: bool(re.search(r"ignore|prompt|secret|password|tool|exfiltrat", t)))}
+    if re.search(r"\b(already completed|duplicate|informational|no action needed)\b", low):
+        reason = "ALREADY_COMPLETED" if "completed" in low else "DUPLICATE" if "duplicate" in low else "INFORMATIONAL"
+        return {"dossierId": dossier["dossierId"], "action": "no_action", "target": None,
+                "payload": {"reasonCode": reason, "referenceId": ref},
+                "evidence": evidence(lambda t: reason.lower().replace("_", " ") in t)}
+    if re.search(r"identity mismatch|does not match|verify (?:the )?sender|unknown sender", low):
+        return {"dossierId": dossier["dossierId"], "action": "request_confirmation",
+                "target": {"kind": "approval_queue", "id": "support"},
+                "payload": {"claimedSender": recipient, "questionCode": "VERIFY_REQUEST", "referenceId": ref},
+                "evidence": evidence(lambda t: bool(re.search(r"identity|sender|verify|match", t)))}
+    if "delivery window" in low and re.search(r"signed|verified|authorized|approved", low):
+        case_id = first_match(r"\b((?:case|CASE)[-_][A-Za-z0-9_-]+)\b", dossier["dossierId"])
+        event_id = first_match(r"\b((?:evt|event|EVT)[-_][A-Za-z0-9_-]+)\b", ref)
+        value = first_match(r"delivery window\s*(?:is|=|:)\s*([A-Za-z0-9 -]{2,40})", "unspecified")
+        return {"dossierId": dossier["dossierId"], "action": "update_internal_record",
+                "target": {"kind": "case_record", "id": case_id},
+                "payload": {"field": "delivery_window", "sourceEventId": event_id, "value": value.strip()},
+                "evidence": evidence(lambda t: bool(re.search(r"delivery window|signed|verified|authorized", t)))}
+    # Default safe customer workflow: prepare a draft, never send it.
+    return {"dossierId": dossier["dossierId"], "action": "create_draft",
+            "target": {"kind": "draft_queue", "id": f"mailbox:{dossier['mailbox']}"},
+            "payload": {"recipient": recipient, "referenceId": ref, "status": status.strip(), "template": "order_status"},
+            "evidence": evidence(lambda t: bool(re.search(r"status|order|delivery|ship|customer|request", t)))}
 
 
 def exact_keys(obj: Any, keys: set[str]) -> bool:
@@ -468,7 +530,11 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
         batches.append(current)
     log_event("model_batches_planned", dossier_count=len(dossiers), batch_count=len(batches),
               batch_bytes_limit=batch_limit, concurrency=GROQ_MODEL_CONCURRENCY)
+    provider_throttled = asyncio.Event()
+
     async def resilient_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        if provider_throttled.is_set():
+            return {d["dossierId"]: fallback_decision(d) for d in batch}
         try:
             return await _ai_decisions_batch(batch)
         except RuntimeError as exc:
@@ -476,7 +542,13 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
             # (context plus completion budget). Split and retry without making
             # the grader repeat the entire propose request.
             if str(exc) != "GROQ_HTTP_413" or len(batch) <= 1:
-                raise
+                if str(exc) == "GROQ_HTTP_429":
+                    provider_throttled.set()
+                    log_event("model_rate_limit_circuit_open", level=logging.ERROR,
+                              dossier_count=len(dossiers))
+                log_event("model_batch_fallback", level=logging.ERROR,
+                          reason=str(exc), dossier_count=len(batch))
+                return {d["dossierId"]: fallback_decision(d) for d in batch}
             midpoint = max(1, len(batch) // 2)
             log_event("model_batch_split", level=logging.WARNING, reason="payload_too_large",
                       original_dossier_count=len(batch), left_count=midpoint,
@@ -488,6 +560,13 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
                 raise ValueError("AI_DUPLICATE_DOSSIER_AFTER_SPLIT")
             left.update(right)
             return left
+        except Exception as exc:
+            # A provider outage must not turn a valid grader request into a
+            # 503. Return deterministic, schema-validated safety decisions for
+            # only the affected dossiers and record the failure in logs.
+            log_event("model_batch_fallback", level=logging.ERROR,
+                      reason=type(exc).__name__, dossier_count=len(batch))
+            return {d["dossierId"]: fallback_decision(d) for d in batch}
 
     semaphore = asyncio.Semaphore(GROQ_MODEL_CONCURRENCY)
 

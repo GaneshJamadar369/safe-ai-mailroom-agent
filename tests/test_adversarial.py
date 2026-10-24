@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 
@@ -63,4 +64,20 @@ def test_model_json_fence_is_narrow():
             pass
         else:
             raise AssertionError("unsafe model text accepted")
+
+
+def test_provider_rate_limit_returns_valid_fallback(monkeypatch):
+    calls = []
+
+    async def throttled(batch):
+        calls.append(len(batch))
+        raise RuntimeError("GROQ_HTTP_429")
+
+    monkeypatch.setattr(mailroom, "_ai_decisions_batch", throttled)
+    dossiers = [_dossier(10), _dossier(11)]
+    decisions = asyncio.run(mailroom.ai_decisions(dossiers))
+
+    assert set(decisions) == {"d10", "d11"}
+    assert all(mailroom.validate_proposal(d, decisions[d["dossierId"]]) for d in dossiers)
+    assert calls == [2]
 
