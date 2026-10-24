@@ -14,7 +14,9 @@ services:
       - key: GROQ_MODEL
         value: openai/gpt-oss-120b
       - key: GROQ_BATCH_BYTES
-        value: "60000"
+        value: "18000"
+      - key: GROQ_MAX_TOKENS
+        value: "4000"
       - key: DATABASE_PATH
         # Free Render services do not provide /var/data unless a paid
         # persistent disk is attached. /tmp is writable at runtime; keep one

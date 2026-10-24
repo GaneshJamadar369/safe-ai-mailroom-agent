@@ -47,7 +47,7 @@ MAX_RESPONSE_BYTES = 512 * 1024
 DB_PATH = os.getenv("DATABASE_PATH", "./data/safe-ai-mailroom.sqlite3")
 GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_BATCH_BYTES = int_env("GROQ_BATCH_BYTES", 60000)
+GROQ_BATCH_BYTES = int_env("GROQ_BATCH_BYTES", 18000)
 GROQ_KEYS_FILE = os.getenv("GROQ_KEYS_FILE", "groqapikeys.txt")
 _groq_key_cursor = 0
 _groq_key_lock = threading.Lock()
@@ -69,7 +69,7 @@ def log_event(event: str, level: int = logging.INFO, **fields: Any) -> None:
             continue
         # Never accidentally emit a secret-like field if a future caller adds
         # one. Values are intentionally limited to metadata below.
-        if any(token in key.lower() for token in ("key", "secret", "token", "signature", "prompt", "content")):
+        if key.lower() in {"api_key", "api_keys", "secret", "token", "signature", "prompt", "content"}:
             safe[key] = "[REDACTED]"
         else:
             safe[key] = value
@@ -391,7 +391,7 @@ async def _ai_decisions_batch(dossiers: list[dict[str, Any]]) -> dict[str, dict[
     body = {
         "model": os.getenv("GROQ_MODEL", GROQ_MODEL),
         "temperature": 0,
-        "max_completion_tokens": int_env("GROQ_MAX_TOKENS", 12000),
+        "max_completion_tokens": int_env("GROQ_MAX_TOKENS", 4000),
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt()},
@@ -463,7 +463,28 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
         batches.append(current)
     log_event("model_batches_planned", dossier_count=len(dossiers), batch_count=len(batches),
               batch_bytes_limit=GROQ_BATCH_BYTES)
-    results = await asyncio.gather(*(_ai_decisions_batch(batch) for batch in batches))
+    async def resilient_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        try:
+            return await _ai_decisions_batch(batch)
+        except RuntimeError as exc:
+            # Groq may enforce a smaller limit than the configured byte target
+            # (context plus completion budget). Split and retry without making
+            # the grader repeat the entire propose request.
+            if str(exc) != "GROQ_HTTP_413" or len(batch) <= 1:
+                raise
+            midpoint = max(1, len(batch) // 2)
+            log_event("model_batch_split", level=logging.WARNING, reason="payload_too_large",
+                      original_dossier_count=len(batch), left_count=midpoint,
+                      right_count=len(batch) - midpoint)
+            left, right = await asyncio.gather(
+                resilient_batch(batch[:midpoint]), resilient_batch(batch[midpoint:]))
+            overlap = set(left).intersection(right)
+            if overlap:
+                raise ValueError("AI_DUPLICATE_DOSSIER_AFTER_SPLIT")
+            left.update(right)
+            return left
+
+    results = await asyncio.gather(*(resilient_batch(batch) for batch in batches))
     merged: dict[str, dict[str, Any]] = {}
     for result in results:
         overlap = set(merged).intersection(result)
