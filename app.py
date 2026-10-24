@@ -4,10 +4,12 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -29,7 +31,49 @@ DB_PATH = os.getenv("DATABASE_PATH", "./data/safe-ai-mailroom.sqlite3")
 GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
+# Render captures stdout/stderr. Emit compact JSON records so failures can be
+# searched by request/evaluation ID without ever logging dossier text,
+# credentials, receipt signatures, or model prompts.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(message)s")
+logger = logging.getLogger("safe_ai_mailroom")
+
 app = FastAPI(title="Safe AI Mailroom", version="1.0.0")
+
+
+def log_event(event: str, level: int = logging.INFO, **fields: Any) -> None:
+    safe: dict[str, Any] = {"event": event, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    for key, value in fields.items():
+        if value is None:
+            continue
+        # Never accidentally emit a secret-like field if a future caller adds
+        # one. Values are intentionally limited to metadata below.
+        if any(token in key.lower() for token in ("key", "secret", "token", "signature", "prompt", "content")):
+            safe[key] = "[REDACTED]"
+        else:
+            safe[key] = value
+    logger.log(level, json.dumps(safe, ensure_ascii=False, separators=(",", ":")))
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    log_event("request_started", request_id=request_id, method=request.method, path=request.url.path)
+    try:
+        result = await call_next(request)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        result.headers["X-Request-ID"] = request_id
+        log_event("request_finished", request_id=request_id, method=request.method, path=request.url.path,
+                  status=result.status_code, elapsed_ms=elapsed_ms)
+        return result
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        logger.exception(json.dumps({"event": "request_crashed", "request_id": request_id,
+                                     "method": request.method, "path": request.url.path,
+                                     "elapsed_ms": elapsed_ms}, separators=(",", ":")))
+        raise
 
 
 def canon(value: Any) -> str:
@@ -48,6 +92,8 @@ def response(data: Any, status: int = 200) -> JSONResponse:
 
 
 def err(code: str, status: int) -> JSONResponse:
+    log_event("error_response", level=logging.WARNING if status < 500 else logging.ERROR,
+              error_code=code, http_status=status)
     return response({"error": code}, status)
 
 
@@ -81,6 +127,7 @@ def tx() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     # journal_mode changes are transactional at the database level and must be
     # issued before BEGIN; doing this inside tx() fails on a fresh SQLite file.
+    started = time.perf_counter()
     con = connect()
     try:
         con.execute("PRAGMA journal_mode=WAL")
@@ -105,11 +152,18 @@ def init_db() -> None:
           created_at REAL NOT NULL
         );
         """)
+    log_event("database_initialized", path=os.getenv("DATABASE_PATH", DB_PATH),
+              elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
 
 
 @app.on_event("startup")
 def startup() -> None:
-    init_db()
+    try:
+        init_db()
+        log_event("startup_completed", database_path=os.getenv("DATABASE_PATH", DB_PATH))
+    except Exception:
+        logger.exception(json.dumps({"event": "startup_failed", "database_path": os.getenv("DATABASE_PATH", DB_PATH)}, separators=(",", ":")))
+        raise
 
 
 @app.get("/")
@@ -278,6 +332,7 @@ Use exact IDs and values in the dossier. Never invent evidence. Return exactly o
 async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     key = os.getenv("GROQ_API_KEY", "").strip()
     if not key:
+        log_event("model_unavailable", level=logging.ERROR, reason="missing_api_key", dossier_count=len(dossiers))
         raise RuntimeError("AI_NOT_CONFIGURED")
     # Input is source data. The prompt explicitly treats all embedded instructions as untrusted.
     body = {
@@ -290,9 +345,20 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
             {"role": "user", "content": canon({"dossiers": dossiers})},
         ],
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(48.0, connect=6.0)) as client:
-        r = await client.post(GROQ_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=body)
+    started = time.perf_counter()
+    log_event("model_call_started", model=body["model"], dossier_count=len(dossiers),
+              input_bytes=len(canon({"dossiers": dossiers}).encode("utf-8")))
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(48.0, connect=6.0)) as client:
+            r = await client.post(GROQ_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=body)
+    except Exception as exc:
+        log_event("model_call_failed", level=logging.ERROR, error_type=type(exc).__name__,
+                  elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
+        raise
+    log_event("model_call_finished", model=body["model"], http_status=r.status_code,
+              elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
     if r.status_code >= 400:
+        log_event("model_http_error", level=logging.ERROR, http_status=r.status_code)
         raise RuntimeError(f"GROQ_HTTP_{r.status_code}")
     content = r.json()["choices"][0]["message"]["content"]
     obj = parse_model_json(content)
@@ -380,6 +446,8 @@ async def propose(obj: dict[str, Any]) -> JSONResponse:
         return err("EVALUATION_ID_REQUIRED", 400)
     issue = validate_dossiers(dossiers)
     if issue:
+        log_event("propose_rejected", level=logging.WARNING, reason=issue, evaluation_id=evaluation_id,
+                  dossier_count=len(dossiers) if isinstance(dossiers, list) else None)
         return err(issue, 422)
     if not valid_public_key(verifier):
         return err("INVALID_RECEIPT_VERIFIER", 422)
@@ -397,7 +465,9 @@ async def propose(obj: dict[str, Any]) -> JSONResponse:
         old = con.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
         if old:
             if old["propose_hash"] != req_hash:
+                log_event("propose_conflict", level=logging.WARNING, evaluation_id=evaluation_id)
                 return err("EVALUATION_ID_CONFLICT", 409)
+            log_event("propose_replay", evaluation_id=evaluation_id, dossier_count=len(dossiers))
             return response(json.loads(old["propose_response_json"]))
     finally:
         con.close()
@@ -419,6 +489,7 @@ async def propose(obj: dict[str, Any]) -> JSONResponse:
         finally:
             con.close()
         if missing:
+            log_event("decision_cache_lookup", evaluation_id=evaluation_id, cache_hits=len(dossiers) - len(missing), cache_misses=len(missing))
             generated = await ai_decisions(missing)
             validated_batch: list[tuple[str, str]] = []
             for d in missing:
@@ -433,6 +504,8 @@ async def propose(obj: dict[str, Any]) -> JSONResponse:
                     row = con.execute("SELECT decision_json FROM decisions WHERE dossier_fingerprint=?", (fingerprints[d["dossierId"]],)).fetchone()
                     if row:
                         proposal_by_id[d["dossierId"]] = json.loads(row["decision_json"])
+        else:
+            log_event("decision_cache_lookup", evaluation_id=evaluation_id, cache_hits=len(dossiers), cache_misses=0)
 
         proposals = []
         for d in dossiers:
@@ -457,12 +530,17 @@ async def propose(obj: dict[str, Any]) -> JSONResponse:
                     return err("EVALUATION_ID_CONFLICT", 409)
                 return response(json.loads(existing["propose_response_json"]))
             con.execute("INSERT INTO evaluations(evaluation_id,propose_hash,input_digest,verifier_json,proposals_json,propose_response_json,created_at) VALUES(?,?,?,?,?,?,?)", (evaluation_id, req_hash, input_digest, canon(verifier), canon(proposals), canon(body), time.time()))
+        log_event("propose_completed", evaluation_id=evaluation_id, dossier_count=len(dossiers),
+                  proposal_count=len(proposals), input_digest=input_digest)
         return response(body)
     except RuntimeError as e:
+        log_event("propose_model_error", level=logging.ERROR, evaluation_id=evaluation_id, error_type=str(e))
         return err("MODEL_UNAVAILABLE" if str(e) != "AI_NOT_CONFIGURED" else "AI_NOT_CONFIGURED", 503)
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        log_event("propose_validation_error", level=logging.ERROR, evaluation_id=evaluation_id)
         return err("PROPOSAL_VALIDATION_FAILED", 422)
     except Exception:
+        logger.exception(json.dumps({"event": "propose_internal_error", "evaluation_id": evaluation_id}, separators=(",", ":")))
         return err("INTERNAL_ERROR", 500)
 
 
@@ -478,13 +556,17 @@ async def commit(obj: dict[str, Any]) -> JSONResponse:
     finally:
         con.close()
     if not row:
+        log_event("commit_rejected", level=logging.WARNING, reason="unknown_evaluation", evaluation_id=evaluation_id)
         return err("UNKNOWN_EVALUATION", 404)
     if input_digest != row["input_digest"]:
+        log_event("commit_rejected", level=logging.WARNING, reason="input_digest_mismatch", evaluation_id=evaluation_id)
         return err("INPUT_DIGEST_MISMATCH", 409)
     commit_hash = digest(obj)
     if row["commit_response_json"]:
         if row["commit_hash"] != commit_hash:
+            log_event("commit_replay_conflict", level=logging.WARNING, evaluation_id=evaluation_id)
             return err("COMMIT_REPLAY_CONFLICT", 409)
+        log_event("commit_replay", evaluation_id=evaluation_id)
         return response(json.loads(row["commit_response_json"]))
 
     proposals = json.loads(row["proposals_json"])
@@ -495,8 +577,10 @@ async def commit(obj: dict[str, Any]) -> JSONResponse:
     seen_receipt_ids: set[str] = set()
     verifier = json.loads(row["verifier_json"])
     # Validate every receipt and every signature before persisting any action/effect.
+    log_event("commit_validation_started", evaluation_id=evaluation_id, receipt_count=len(receipts), proposal_count=len(proposals))
     for rec in receipts:
         if not isinstance(rec, dict):
+            log_event("receipt_rejected", level=logging.WARNING, evaluation_id=evaluation_id, reason="not_object")
             return err("INVALID_RECEIPT", 422)
         required = {"dossierId", "callId", "action", "accepted", "proposalDigest", "receiptId", "receiptSignature"}
         if set(rec) != required:
@@ -512,6 +596,8 @@ async def commit(obj: dict[str, Any]) -> JSONResponse:
             return err("INVALID_RECEIPT_FIELDS", 422)
         seen_receipt_ids.add(rec["receiptId"])
         if not verify_receipt_signature(verifier, evaluation_id, input_digest, rec):
+            log_event("receipt_rejected", level=logging.WARNING, evaluation_id=evaluation_id, reason="invalid_signature",
+                      dossier_id=rec.get("dossierId") if isinstance(rec.get("dossierId"), str) else None)
             return err("INVALID_RECEIPT_SIGNATURE", 422)
     if seen != set(proposal_by_key):
         return err("RECEIPT_SET_MISMATCH", 422)
@@ -532,6 +618,7 @@ async def commit(obj: dict[str, Any]) -> JSONResponse:
                 return err("COMMIT_REPLAY_CONFLICT", 409)
             return response(json.loads(now_row["commit_response_json"]))
         con.execute("UPDATE evaluations SET commit_hash=?,commit_response_json=? WHERE evaluation_id=? AND commit_response_json IS NULL", (commit_hash, canon(body), evaluation_id))
+    log_event("commit_completed", evaluation_id=evaluation_id, outcome_count=len(outcomes))
     return response(body)
 
 

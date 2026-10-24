@@ -12,4 +12,9 @@ services:
       - key: GROQ_MODEL
         value: openai/gpt-oss-120b
       - key: DATABASE_PATH
-        value: /var/data/safe-ai-mailroom.sqlite3
+        # Free Render services do not provide /var/data unless a paid
+        # persistent disk is attached. /tmp is writable at runtime; keep one
+        # worker so SQLite remains consistent for the service lifetime.
+        value: /tmp/safe-ai-mailroom.sqlite3
+      - key: LOG_LEVEL
+        value: INFO

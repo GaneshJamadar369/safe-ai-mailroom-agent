@@ -15,11 +15,13 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 `.env.example` is documentation only; FastAPI does not load it automatically. Set `GROQ_API_KEY` in the process environment or your hosting provider's secret manager, and never commit a real key.
 
+Render logs are JSON lines. Search by `request_id` or `evaluation_id`; set `LOG_LEVEL=DEBUG` temporarily for framework-level diagnostics. Logs intentionally exclude raw dossier text, model prompts, API keys, receipt signatures, and other secret material.
+
 The single public POST endpoint is `/`. Send `Content-Type: application/json` and the JSON envelopes from the assignment. The service uses AI only for semantic decisions; schema checks, canonical hashing, persistence, replay/conflict handling, and Ed25519 receipt validation use deterministic code.
 
 ## Deployment
 
-Use Render or another persistent-disk host. The SQLite file must live on persistent storage. On Render, attach a persistent disk mounted at `/var/data` and set `DATABASE_PATH=/var/data/safe-ai-mailroom.sqlite3`. Add `GROQ_API_KEY` through the dashboard; never commit credentials. Submit the HTTPS service root URL, with no query string or fragment.
+Use Render or another host with writable storage. The included free-plan Render configuration uses `/tmp/safe-ai-mailroom.sqlite3`; this survives requests while the instance is running but is reset when Render replaces the instance. For durable evaluation caching across restarts, attach a paid persistent disk mounted at `/var/data` and set `DATABASE_PATH=/var/data/safe-ai-mailroom.sqlite3`. Add `GROQ_API_KEY` through the dashboard; never commit credentials. Submit the HTTPS service root URL, with no query string or fragment.
 
 ## Important limits
 
