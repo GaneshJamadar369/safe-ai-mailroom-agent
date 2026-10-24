@@ -334,6 +334,22 @@ def fallback_decision(dossier: dict[str, Any]) -> dict[str, Any]:
                 "target": {"kind": "approval_queue", "id": "support"},
                 "payload": {"claimedSender": recipient, "questionCode": "VERIFY_REQUEST", "referenceId": ref},
                 "evidence": evidence(lambda t: bool(re.search(r"identity|sender|verify|match", t)))}
+    # An outbound action is executable only when the dossier itself contains
+    # explicit, current approval scoped to the recipient and the required
+    # template. This keeps the fallback useful for audit cases without
+    # treating a generic "approved" or quoted instruction as authorization.
+    approved_notice = re.search(
+        r"(?:approved|authori[sz]ed|consent(?:ed)?)\b.*(?:send|notice|email)"
+        r"|(?:send|notice|email).*\b(?:approved|authori[sz]ed|consent(?:ed)?)\b", low
+    )
+    notice_template = re.search(r"approved[_ -]?delivery[_ -]?notice", low)
+    if approved_notice and notice_template and recipient != "customer" and not re.search(
+        r"old|expired|superseded|wrong recipient|different recipient|mismatch|revoke", low
+    ):
+        return {"dossierId": dossier["dossierId"], "action": "send_approved_notice",
+                "target": {"kind": "email", "id": recipient},
+                "payload": {"referenceId": ref, "status": status.strip(), "template": "approved_delivery_notice"},
+                "evidence": evidence(lambda t: bool(re.search(r"approved|authori[sz]ed|consent|recipient|template|status", t)))}
     if "delivery window" in low and re.search(r"signed|verified|authorized|approved", low):
         case_id = first_match(r"\b((?:case|CASE)[-_][A-Za-z0-9_-]+)\b", dossier["dossierId"])
         event_id = first_match(r"\b((?:evt|event|EVT)[-_][A-Za-z0-9_-]+)\b", ref)
