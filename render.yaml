@@ -25,6 +25,10 @@ services:
         value: nvidia/nemotron-3-ultra-550b-a55b
       - key: NVIDIA_URL
         value: https://integrate.api.nvidia.com/v1/chat/completions
+      - key: NVIDIA_BATCH_BYTES
+        value: "150000"
+      - key: NVIDIA_MAX_TOKENS
+        value: "8000"
       - key: DATABASE_PATH
         # Free Render services do not provide /var/data unless a paid
         # persistent disk is attached. /tmp is writable at runtime; keep one

@@ -52,6 +52,8 @@ GROQ_MODEL_CONCURRENCY = int_env("GROQ_MODEL_CONCURRENCY", 2)
 GROQ_KEYS_FILE = os.getenv("GROQ_KEYS_FILE", "groqapikeys.txt")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+NVIDIA_BATCH_BYTES = int_env("NVIDIA_BATCH_BYTES", 150000)
+NVIDIA_MAX_TOKENS = int_env("NVIDIA_MAX_TOKENS", 8000)
 _nvidia_url = os.getenv("NVIDIA_URL", "https://integrate.api.nvidia.com/v1/chat/completions").strip()
 NVIDIA_URL = ("https://integrate.api.nvidia.com" + _nvidia_url
               if _nvidia_url.startswith("/") else _nvidia_url)
@@ -225,7 +227,9 @@ def startup() -> None:
                   max_tokens=int_env("GROQ_MAX_TOKENS", 2000),
                   configured_key_count=len(groq_api_keys()),
                   secondary_provider="nvidia" if NVIDIA_API_KEY else None,
-                  secondary_model=NVIDIA_MODEL if NVIDIA_API_KEY else None)
+                  secondary_model=NVIDIA_MODEL if NVIDIA_API_KEY else None,
+                  secondary_batch_bytes=NVIDIA_BATCH_BYTES if NVIDIA_API_KEY else None,
+                  secondary_max_tokens=NVIDIA_MAX_TOKENS if NVIDIA_API_KEY else None)
     except Exception:
         logger.exception(json.dumps({"event": "startup_failed", "database_path": os.getenv("DATABASE_PATH", DB_PATH)}, separators=(",", ":")))
         raise
@@ -532,7 +536,12 @@ async def _nvidia_decisions_batch(dossiers: list[dict[str, Any]]) -> dict[str, d
     body = {
         "model": NVIDIA_MODEL,
         "temperature": 0,
-        "max_tokens": int_env("GROQ_MAX_TOKENS", 2000),
+        "max_tokens": NVIDIA_MAX_TOKENS,
+        # Nemotron supports disabling its reasoning trace through the
+        # OpenAI-compatible API. The task needs compact JSON decisions and a
+        # bounded grader response, so avoid spending the budget on hidden
+        # reasoning tokens.
+        "reasoning_effort": "none",
         "messages": [
             {"role": "system", "content": system_prompt()},
             {"role": "user", "content": canon({"dossiers": dossiers})},
@@ -589,7 +598,11 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
     # Groq's effective request limit includes system prompt and completion
     # allowance. Cap user configuration at a conservative payload size; the
     # recursive splitter remains available for unusually large dossiers.
-    batch_limit = min(GROQ_BATCH_BYTES, 8500)
+    # NVIDIA's hosted model has a much larger context window than Groq's
+    # gateway. When configured, use a few large requests so slow per-call
+    # latency does not turn 64 dossiers into dozens of sequential calls.
+    batch_limit = NVIDIA_BATCH_BYTES if NVIDIA_API_KEY else min(GROQ_BATCH_BYTES, 8500)
+    batch_limit = max(8500, batch_limit)
     for dossier in dossiers:
         size = len(canon(dossier).encode("utf-8"))
         if current and current_bytes + size > batch_limit:
@@ -614,7 +627,7 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
                               provider="nvidia", reason=type(exc).__name__, dossier_count=len(batch))
             return {d["dossierId"]: fallback_decision(d) for d in batch}
         try:
-            return await _ai_decisions_batch(batch)
+            return await (_nvidia_decisions_batch(batch) if NVIDIA_API_KEY else _ai_decisions_batch(batch))
         except RuntimeError as exc:
             # Groq may enforce a smaller limit than the configured byte target
             # (context plus completion budget). Split and retry without making
