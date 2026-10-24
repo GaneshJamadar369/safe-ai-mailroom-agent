@@ -89,3 +89,18 @@ def test_proposal_digest_canonicalizes_evidence_order():
     reordered = {**p, "evidence": list(reversed(p["evidence"]))}
     assert mailroom.proposal_digest(p) == mailroom.proposal_digest(reordered)
 
+
+def test_nvidia_secondary_provider_is_used_after_groq_limit(monkeypatch):
+    async def groq_limited(batch):
+        raise RuntimeError("GROQ_HTTP_429")
+
+    async def nvidia_ok(batch):
+        return {d["dossierId"]: _proposal(d, "no_action") for d in batch}
+
+    monkeypatch.setattr(mailroom, "NVIDIA_API_KEY", "configured-for-test")
+    monkeypatch.setattr(mailroom, "_ai_decisions_batch", groq_limited)
+    monkeypatch.setattr(mailroom, "_nvidia_decisions_batch", nvidia_ok)
+    d = _dossier(13)
+    result = asyncio.run(mailroom.ai_decisions([d]))
+    assert result["d13"]["action"] == "no_action"
+

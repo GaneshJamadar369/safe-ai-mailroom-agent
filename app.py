@@ -50,6 +50,11 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BATCH_BYTES = int_env("GROQ_BATCH_BYTES", 8500)
 GROQ_MODEL_CONCURRENCY = int_env("GROQ_MODEL_CONCURRENCY", 2)
 GROQ_KEYS_FILE = os.getenv("GROQ_KEYS_FILE", "groqapikeys.txt")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+_nvidia_url = os.getenv("NVIDIA_URL", "https://integrate.api.nvidia.com/v1/chat/completions").strip()
+NVIDIA_URL = ("https://integrate.api.nvidia.com" + _nvidia_url
+              if _nvidia_url.startswith("/") else _nvidia_url)
 _groq_key_cursor = 0
 _groq_key_lock = threading.Lock()
 
@@ -218,7 +223,9 @@ def startup() -> None:
                   model=GROQ_MODEL, batch_bytes_limit=min(GROQ_BATCH_BYTES, 8500),
                   model_concurrency=GROQ_MODEL_CONCURRENCY,
                   max_tokens=int_env("GROQ_MAX_TOKENS", 2000),
-                  configured_key_count=len(groq_api_keys()))
+                  configured_key_count=len(groq_api_keys()),
+                  secondary_provider="nvidia" if NVIDIA_API_KEY else None,
+                  secondary_model=NVIDIA_MODEL if NVIDIA_API_KEY else None)
     except Exception:
         logger.exception(json.dumps({"event": "startup_failed", "database_path": os.getenv("DATABASE_PATH", DB_PATH)}, separators=(",", ":")))
         raise
@@ -518,6 +525,55 @@ async def _ai_decisions_batch(dossiers: list[dict[str, Any]]) -> dict[str, dict[
     return out
 
 
+async def _nvidia_decisions_batch(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Use NVIDIA's OpenAI-compatible endpoint after Groq is throttled."""
+    if not NVIDIA_API_KEY:
+        raise RuntimeError("NVIDIA_NOT_CONFIGURED")
+    body = {
+        "model": NVIDIA_MODEL,
+        "temperature": 0,
+        "max_tokens": int_env("GROQ_MAX_TOKENS", 2000),
+        "messages": [
+            {"role": "system", "content": system_prompt()},
+            {"role": "user", "content": canon({"dossiers": dossiers})},
+        ],
+    }
+    started = time.perf_counter()
+    log_event("secondary_model_call_started", provider="nvidia", model=NVIDIA_MODEL,
+              dossier_count=len(dossiers), input_bytes=len(canon({"dossiers": dossiers}).encode("utf-8")))
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(48.0, connect=6.0)) as client:
+            r = await client.post(NVIDIA_URL,
+                                  headers={"Authorization": f"Bearer {NVIDIA_API_KEY}",
+                                           "Content-Type": "application/json"}, json=body)
+    except Exception as exc:
+        log_event("secondary_model_call_failed", level=logging.ERROR, provider="nvidia",
+                  error_type=type(exc).__name__, elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
+        raise RuntimeError("NVIDIA_REQUEST_FAILED") from exc
+    log_event("secondary_model_call_finished", provider="nvidia", model=NVIDIA_MODEL,
+              http_status=r.status_code, elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
+    if r.status_code >= 400:
+        raise RuntimeError(f"NVIDIA_HTTP_{r.status_code}")
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+        obj = parse_model_json(content)
+        arr = obj.get("proposals")
+        expected = [d["dossierId"] for d in dossiers]
+        if not isinstance(arr, list) or len(arr) != len(dossiers):
+            raise ValueError("AI_PROPOSAL_COUNT_MISMATCH")
+        out: dict[str, dict[str, Any]] = {}
+        for item in arr:
+            if not isinstance(item, dict) or item.get("dossierId") not in expected or item["dossierId"] in out:
+                raise ValueError("AI_UNKNOWN_OR_DUPLICATE_DOSSIER")
+            out[item["dossierId"]] = item
+        if set(out) != set(expected):
+            raise ValueError("AI_MISSING_DOSSIER")
+        log_event("secondary_model_decisions_accepted", provider="nvidia", dossier_count=len(out))
+        return out
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("NVIDIA_INVALID_RESPONSE") from exc
+
+
 async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Evaluate dossiers in bounded concurrent batches.
 
@@ -550,6 +606,12 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
 
     async def resilient_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if provider_throttled.is_set():
+            if NVIDIA_API_KEY:
+                try:
+                    return await _nvidia_decisions_batch(batch)
+                except Exception as exc:
+                    log_event("secondary_model_fallback", level=logging.ERROR,
+                              provider="nvidia", reason=type(exc).__name__, dossier_count=len(batch))
             return {d["dossierId"]: fallback_decision(d) for d in batch}
         try:
             return await _ai_decisions_batch(batch)
@@ -562,6 +624,13 @@ async def ai_decisions(dossiers: list[dict[str, Any]]) -> dict[str, dict[str, An
                     provider_throttled.set()
                     log_event("model_rate_limit_circuit_open", level=logging.ERROR,
                               dossier_count=len(dossiers))
+                    if NVIDIA_API_KEY:
+                        try:
+                            return await _nvidia_decisions_batch(batch)
+                        except Exception as secondary_exc:
+                            log_event("secondary_model_fallback", level=logging.ERROR,
+                                      provider="nvidia", reason=type(secondary_exc).__name__,
+                                      dossier_count=len(batch))
                 log_event("model_batch_fallback", level=logging.ERROR,
                           reason=str(exc), dossier_count=len(batch))
                 return {d["dossierId"]: fallback_decision(d) for d in batch}

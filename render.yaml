@@ -19,6 +19,12 @@ services:
         value: "2000"
       - key: GROQ_MODEL_CONCURRENCY
         value: "2"
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3-ultra-550b-a55b
+      - key: NVIDIA_URL
+        value: https://integrate.api.nvidia.com/v1/chat/completions
       - key: DATABASE_PATH
         # Free Render services do not provide /var/data unless a paid
         # persistent disk is attached. /tmp is writable at runtime; keep one
