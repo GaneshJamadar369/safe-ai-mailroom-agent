@@ -81,3 +81,11 @@ def test_provider_rate_limit_returns_valid_fallback(monkeypatch):
     assert all(mailroom.validate_proposal(d, decisions[d["dossierId"]]) for d in dossiers)
     assert calls == [2]
 
+
+def test_proposal_digest_canonicalizes_evidence_order():
+    d = _dossier(12)
+    p = _proposal(d, "create_draft")
+    p["callId"] = "mailroom-test-call-12"
+    reordered = {**p, "evidence": list(reversed(p["evidence"]))}
+    assert mailroom.proposal_digest(p) == mailroom.proposal_digest(reordered)
+

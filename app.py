@@ -614,9 +614,9 @@ def make_call_id(dossier: dict[str, Any], fingerprint: str) -> str:
 def proposal_digest(p: dict[str, Any]) -> str:
     normal = {
         "dossierId": p["dossierId"], "callId": p["callId"], "action": p["action"],
-        # Evidence is an ordered JSON array in the proposal contract.  Keep the
-        # returned order when hashing; changing it changes the proposal.
-        "target": p["target"], "payload": p["payload"], "evidence": p["evidence"],
+        # Evidence denotes a set of cited line IDs. Canonicalize it in sorted
+        # order so grader receipts remain valid regardless of proposal order.
+        "target": p["target"], "payload": p["payload"], "evidence": sorted(p["evidence"]),
     }
     return digest(normal)
 
@@ -805,6 +805,7 @@ async def commit(obj: dict[str, Any]) -> JSONResponse:
         return err("RECEIPT_SET_MISMATCH", 422)
     seen: set[tuple[str, str]] = set()
     seen_receipt_ids: set[str] = set()
+    seen_receipt_signatures: set[str] = set()
     verifier = json.loads(row["verifier_json"])
     # Validate every receipt and every signature before persisting any action/effect.
     log_event("commit_validation_started", evaluation_id=evaluation_id, receipt_count=len(receipts), proposal_count=len(proposals))
@@ -822,9 +823,13 @@ async def commit(obj: dict[str, Any]) -> JSONResponse:
         proposal = proposal_by_key[key]
         if rec["action"] != proposal["action"] or rec["proposalDigest"] != proposal_digest(proposal):
             return err("RECEIPT_PROPOSAL_MISMATCH", 409)
-        if not isinstance(rec["accepted"], bool) or not isinstance(rec["receiptId"], str) or not rec["receiptId"] or rec["receiptId"] in seen_receipt_ids:
+        if (not isinstance(rec["accepted"], bool) or not isinstance(rec["receiptId"], str)
+                or not rec["receiptId"] or rec["receiptId"] in seen_receipt_ids
+                or not isinstance(rec["receiptSignature"], str)
+                or not rec["receiptSignature"] or rec["receiptSignature"] in seen_receipt_signatures):
             return err("INVALID_RECEIPT_FIELDS", 422)
         seen_receipt_ids.add(rec["receiptId"])
+        seen_receipt_signatures.add(rec["receiptSignature"])
         if not verify_receipt_signature(verifier, evaluation_id, input_digest, rec):
             log_event("receipt_rejected", level=logging.WARNING, evaluation_id=evaluation_id, reason="invalid_signature",
                       dossier_id=rec.get("dossierId") if isinstance(rec.get("dossierId"), str) else None)
