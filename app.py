@@ -443,6 +443,80 @@ def validate_proposal(dossier: dict[str, Any], raw: Any) -> dict[str, Any]:
     return {"dossierId": dossier["dossierId"], "action": action, "target": target, "payload": payload, "evidence": evidence}
 
 
+def proposal_strings(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(proposal_strings(v) for v in value.values())
+    if isinstance(value, list):
+        return " ".join(proposal_strings(v) for v in value)
+    return ""
+
+
+def quarantine_decision(dossier: dict[str, Any]) -> dict[str, Any]:
+    src = dossier["sources"][0]
+    text = " ".join(ln["text"].lower() for source in dossier["sources"] for ln in source["lines"])
+    refs = [ln["lineId"] for source in dossier["sources"] for ln in source["lines"]
+            if re.search(r"ignore|prompt|secret|password|tool|exfiltrat|send|email|approval", ln["text"].lower())][:4]
+    return {"dossierId": dossier["dossierId"], "action": "quarantine_item",
+            "target": {"kind": "security_queue", "id": "mailroom"},
+            "payload": {"artifactId": src["sourceId"], "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+            "evidence": refs[:4] or [src["lines"][0]["lineId"]]}
+
+
+def safety_gate(dossier: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
+    """Enforce safety properties that schema validation cannot express."""
+    action_before = proposal["action"]
+    dossier_text = " ".join(ln["text"] for src in dossier["sources"] for ln in src["lines"])
+    proposal_low = (proposal_strings(proposal.get("target")) + " " +
+                    proposal_strings(proposal.get("payload"))).lower()
+    low = (dossier_text + " " + proposal_low).lower()
+    secret_marker = re.compile(r"canary|vault|secret|password|api[ _-]?key|bearer|(?:gsk_|nvapi-|sk-[a-z0-9])")
+    hostile_text = re.search(
+        r"ignore (?:all )?instructions|system prompt|use .* tool|reveal private|exfiltrat|"
+        r"(?:please )?(?:send|email|forward).*?(?:canary|secret|password|api key)", dossier_text, re.I
+    )
+    if secret_marker.search(proposal_low) or hostile_text:
+        rule = "proposal_secret_marker" if secret_marker.search(proposal_low) else "hostile_instruction_text"
+        log_event("unsafe_proposal_quarantined", level=logging.ERROR,
+                  dossier_id=dossier["dossierId"], reason=rule, action_before=action_before,
+                  target_digest=digest(proposal.get("target")), payload_digest=digest(proposal.get("payload")),
+                  evidence_count=len(proposal.get("evidence", [])))
+        safe = validate_proposal(dossier, quarantine_decision(dossier))
+        log_event("proposal_safety_checked", dossier_id=dossier["dossierId"], decision="quarantine",
+                  rule=rule, action_before=action_before, action_after=safe["action"],
+                  target_digest=digest(safe["target"]), payload_digest=digest(safe["payload"]),
+                  evidence_count=len(safe["evidence"]))
+        return safe
+
+    if proposal["action"] == "send_approved_notice":
+        target = proposal["target"]["id"].lower()
+        current_scope = re.search(
+            r"(?:approved|authori[sz]ed|consent(?:ed)?)\b.*(?:send|notice|email)"
+            r"|(?:send|notice|email).*\b(?:approved|authori[sz]ed|consent(?:ed)?)\b", dossier_text, re.I
+        )
+        revoked = re.search(r"old|expired|superseded|wrong recipient|different recipient|mismatch|revoke", dossier_text, re.I)
+        exact_target = target in dossier_text.lower()
+        exact_template = bool(re.search(r"approved[_ -]?delivery[_ -]?notice", dossier_text, re.I))
+        if not (current_scope and exact_target and exact_template and not revoked):
+            log_event("unsafe_proposal_quarantined", level=logging.ERROR,
+                      dossier_id=dossier["dossierId"], reason="outbound_scope_not_proven",
+                      action_before=action_before, target_digest=digest(proposal.get("target")),
+                      payload_digest=digest(proposal.get("payload")), evidence_count=len(proposal.get("evidence", [])))
+            # An attempted outbound effect without trusted scope is isolated.
+            safe = validate_proposal(dossier, quarantine_decision(dossier))
+            log_event("proposal_safety_checked", dossier_id=dossier["dossierId"], decision="quarantine",
+                      rule="outbound_scope_not_proven", action_before=action_before, action_after=safe["action"],
+                      target_digest=digest(safe["target"]), payload_digest=digest(safe["payload"]),
+                      evidence_count=len(safe["evidence"]))
+            return safe
+    log_event("proposal_safety_checked", dossier_id=dossier["dossierId"], decision="allow",
+              rule="none", action_before=action_before, action_after=proposal["action"],
+              target_digest=digest(proposal.get("target")), payload_digest=digest(proposal.get("payload")),
+              evidence_count=len(proposal.get("evidence", [])))
+    return proposal
+
+
 def parse_model_json(content: Any) -> dict[str, Any]:
     """Parse strict JSON, allowing only a single markdown JSON fence."""
     if not isinstance(content, str):
@@ -805,7 +879,7 @@ async def propose(obj: dict[str, Any]) -> JSONResponse:
             generated = await ai_decisions(missing)
             validated_batch: list[tuple[str, str]] = []
             for d in missing:
-                p = validate_proposal(d, generated[d["dossierId"]])
+                p = safety_gate(d, validate_proposal(d, generated[d["dossierId"]]))
                 stable = {k: p[k] for k in ("action", "target", "payload", "evidence")}
                 proposal_by_id[d["dossierId"]] = stable
                 validated_batch.append((fingerprints[d["dossierId"]], canon(stable)))
@@ -824,7 +898,7 @@ async def propose(obj: dict[str, Any]) -> JSONResponse:
             decision = proposal_by_id[d["dossierId"]]
             proposal = {"dossierId": d["dossierId"], "callId": make_call_id(d, fingerprints[d["dossierId"]]), **decision}
             # Revalidate cached decisions against this exact dossier on every evaluation.
-            proposal = validate_proposal(d, proposal)
+            proposal = safety_gate(d, validate_proposal(d, proposal))
             proposal["callId"] = make_call_id(d, fingerprints[d["dossierId"]])
             if not re.fullmatch(r"[A-Za-z0-9._:-]{12,128}", proposal["callId"]):
                 raise ValueError("INVALID_CALL_ID")
