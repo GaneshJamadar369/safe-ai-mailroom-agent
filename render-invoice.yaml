@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: safe-invoice-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn invoice_app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: A2A_BEARER_TOKEN
+        sync: false
+      - key: A2A_BASE_URL
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3-ultra-550b-a55b
+      - key: NVIDIA_URL
+        value: https://integrate.api.nvidia.com/v1/chat/completions
+      - key: INVOICE_DATABASE_PATH
+        value: /tmp/safe-ai-invoice.sqlite3
+      - key: LOG_LEVEL
+        value: INFO
